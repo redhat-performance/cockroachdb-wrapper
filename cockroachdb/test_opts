@@ -1,0 +1,5 @@
+kv_95pct_reads,kv --read-percent 95
+kv_50pct_reads,kv --read-percent 50
+kv_60pct_reads,kv --read-percent 60
+kv_10pct_reads,kv --read-percent 10
+movr,movr
