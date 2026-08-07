@@ -164,7 +164,7 @@ install_test_tools()
 #
 install_cockroachdb()
 {
-	cockroach_dir="${run_dir}/cockroach-build"
+	cockroach_dir="${run_dir}/cockroach-build-${cockroach_version}"
 	if [[ -d "$cockroach_dir" ]]; then
 		echo "CockroachDB already installed at $cockroach_dir"
 		return
@@ -358,8 +358,7 @@ generate_combine_report()
 			file="cockroachdb_iter_${iter}.csv"
 			rval=$(grep "^${workload_name},${conc}," $file | cut -d, -f3 | cut -d. -f1)
 			if [[ -z $rval ]]; then
-				echo Error in parsing cockroachdb_iter_${iter}.csv
-				continue
+				exit_out "Error: failed to parse ${workload_name},${conc} from cockroachdb_iter_${iter}.csv" 104
 			fi
 			let "sum=${sum}+${rval}"
 			values="${values}${val_sep}${rval}"

@@ -13,7 +13,7 @@ class Workload(Enum):
 class Cockroachdb_Results(pydantic.BaseModel):
     Workload: Workload
     Concurrency: int = pydantic.Field(gt=0)
-    Average: float = pydantic.Field(allow_inf_nan=False)
-    Deviation: float = pydantic.Field(allow_inf_nan=False)
+    Average: float = pydantic.Field(allow_inf_nan=False, ge=0)
+    Deviation: float = pydantic.Field(allow_inf_nan=False, ge=0)
     Start_Date: datetime.datetime
     End_Date: datetime.datetime
