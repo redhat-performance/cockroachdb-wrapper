@@ -361,6 +361,7 @@ generate_combine_report()
 			val_sep=" "
 		done
 		avg=$(echo "scale=1; $sum/$to_times_to_run" | bc | sed 's/^\./0./')
+		deviation=0
 		if [[ $to_times_to_run -gt 1 ]]; then
 			sumsq=0
 			for v in $values; do
@@ -369,11 +370,7 @@ generate_combine_report()
 			stddev=$(echo "scale=2; sqrt($sumsq / $to_times_to_run)" | bc -l | sed 's/^\./0./')
 			if [[ $(echo "$avg > 0" | bc) -eq 1 ]]; then
 				deviation=$(echo "scale=2; $stddev * 100 / $avg" | bc | sed 's/^\./0./')
-			else
-				deviation="0"
 			fi
-		else
-			deviation="0"
 		fi
 		echo ${workload_name},${conc},${avg},${deviation},${start_time},${end_time} >> $results_file
 	done
