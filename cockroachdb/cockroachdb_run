@@ -287,6 +287,10 @@ execute_cockroachdb()
 			echo "Running: $workload_name at concurrency $conc (iteration $iter)"
 			ops_sec=$(run_single_workload "$workload_name" "$workload_opts" "$conc" "$iter")
 
+			if [[ $to_use_pcp -eq 0 ]]; then
+				rm -f "${run_dir}/raw_${workload_name}_c${conc}_iter${iter}.out"
+			fi
+
 			end_time=$(retrieve_time_stamp)
 			stop_cockroachdb
 
@@ -297,8 +301,8 @@ execute_cockroachdb()
 				results2pcp_add_value "concurrency:${conc}"
 				results2pcp_add_value "average:${ops_sec}"
 				results2pcp_add_value_commit
-				reset_pcp_om
 				stop_pcp_subset
+				reset_pcp_om
 			fi
 		done
 	done < "$opts_file"
@@ -326,11 +330,6 @@ execute_cockroachdb()
 	fi
 }
 
-#
-# Compute a trimmed mean for each workload+concurrency combination across
-# multiple iterations.  For 5 or more iterations the highest and lowest
-# values are dropped before averaging.
-#
 generate_combine_report()
 {
 	rm -f $results_file
@@ -340,15 +339,12 @@ generate_combine_report()
 		--tuned $to_tuned_setting --results_version $cockroachdb_wrapper_version \
 		--test_name $test_name --field_header "Workload,Concurrency,Average,Deviation"
 
-	# Build a list of unique workload,concurrency pairs from the first iteration.
 	combos=$(grep -v "^#" cockroachdb_iter_1.csv | tail -n +2 | cut -d, -f1,2)
 
 	for combo in $combos
 	do
 		workload_name=$(echo $combo | cut -d, -f1)
 		conc=$(echo $combo | cut -d, -f2)
-		high=0
-		low=""
 		sum=0
 		values=""
 		val_sep=""
@@ -363,28 +359,16 @@ generate_combine_report()
 			let "sum=${sum}+${rval}"
 			values="${values}${val_sep}${rval}"
 			val_sep=" "
-			if [[ $rval -gt $high ]]; then
-				high=$rval
-			fi
-			if [[ $low == "" ]] || [[ $rval -lt $low ]]; then
-				low=$rval
-			fi
 		done
-		if [[ $to_times_to_run -gt 4 ]]; then
-			let "samples=${to_times_to_run}-2"
-			let "sum=${sum}-${high}-${low}"
-		else
-			samples=${to_times_to_run}
-		fi
-		avg=$(echo "scale=1; $sum/$samples" | bc)
+		avg=$(echo "scale=1; $sum/$to_times_to_run" | bc | sed 's/^\./0./')
 		if [[ $to_times_to_run -gt 1 ]]; then
 			sumsq=0
 			for v in $values; do
 				sumsq=$(echo "$sumsq + ($v - $avg) * ($v - $avg)" | bc)
 			done
-			stddev=$(echo "scale=2; sqrt($sumsq / $to_times_to_run)" | bc -l)
+			stddev=$(echo "scale=2; sqrt($sumsq / $to_times_to_run)" | bc -l | sed 's/^\./0./')
 			if [[ $(echo "$avg > 0" | bc) -eq 1 ]]; then
-				deviation=$(echo "scale=2; $stddev * 100 / $avg" | bc)
+				deviation=$(echo "scale=2; $stddev * 100 / $avg" | bc | sed 's/^\./0./')
 			else
 				deviation="0"
 			fi
