@@ -244,11 +244,12 @@ The script computes combined results across multiple iterations:
 
 ## Return Codes
 
-The script uses standardized error codes from test_tools error_codes:
-- **0**: Success
-- **101**: Git clone failure (test_tools)
-- **102**: CockroachDB binary download failure
-- **103**: CockroachDB failed to start
+The script uses standardized error codes from `test_tools/error_codes`:
+- **0** (`E_SUCCESS`): Success
+- **101** (`E_GENERAL`): General failure — test_tools git clone failure, CockroachDB binary download failure, or CockroachDB failed to start
+- **106** (`E_INVAL_DATA`): Failed to parse a workload's result value while combining iteration results
+
+Other exit codes surfaced by the script (usage errors, argument parsing, PCP failures, validation failures) come from `general_setup` and the shared `test_tools` utilities it invokes (`csv_to_json`, `verify_results`); see `test_tools/error_codes` for the full list.
 
 Exit codes indicate specific failure points for automated testing workflows.
 

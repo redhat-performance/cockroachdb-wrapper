@@ -82,6 +82,18 @@ show_usage=0
 TOOLS_BIN="$HOME/test_tools"
 export TOOLS_BIN
 
+#
+# error_codes is normally sourced by general_setup, but a few failures below
+# can happen before general_setup runs.  Provide matching defaults so named
+# codes are always available, then pick up the authoritative values once
+# error_codes exists.
+#
+E_GENERAL=101
+E_INVAL_DATA=106
+if [[ -f "$TOOLS_BIN/error_codes" ]]; then
+	source "$TOOLS_BIN/error_codes"
+fi
+
 usage()
 {
 	echo "Usage $1:"
@@ -117,7 +129,7 @@ attempt_tools_git()
 	if [[ ! -d "$TOOLS_BIN" ]]; then
 		git clone $tools_git "$TOOLS_BIN"
 		if [ $? -ne 0 ]; then
-			exit_out "Error: pulling git $tools_git failed." 101
+			exit_out "Error: pulling git $tools_git failed." $E_GENERAL
 		fi
 	fi
 }
@@ -179,9 +191,11 @@ install_cockroachdb()
 
 	echo "Downloading CockroachDB ${cockroach_version}..."
 	url="https://binaries.cockroachdb.com/${tarball}"
-	if ! wget -q "$url" -O "$tarball" 2>/dev/null; then
-		if ! curl -sL "$url" -o "$tarball" 2>/dev/null; then
-			exit_out "Failed to download CockroachDB from $url" 102
+	wget -q "$url" -O "$tarball" 2>/dev/null
+	if [[ $? -ne 0 ]]; then
+		curl -sL "$url" -o "$tarball" 2>/dev/null
+		if [[ $? -ne 0 ]]; then
+			exit_out "Failed to download CockroachDB from $url" $E_GENERAL
 		fi
 	fi
 
@@ -203,10 +217,18 @@ start_cockroachdb()
 		--store=${run_dir}/cockroach-data --listen-addr=127.0.0.1:26257 \
 		--http-addr=127.0.0.1:8080 > ${run_dir}/cockroach_start.log 2>&1
 
-	sleep 5
+	ready=0
+	for i in $(seq 1 30); do
+		$cockroach_bin node status --insecure --host=127.0.0.1:26257 > /dev/null 2>&1
+		if [[ $? -eq 0 ]]; then
+			ready=1
+			break
+		fi
+		sleep 1
+	done
 
-	if ! $cockroach_bin node status --insecure --host=127.0.0.1:26257 > /dev/null 2>&1; then
-		exit_out "CockroachDB failed to start" 103
+	if [[ $ready -eq 0 ]]; then
+		exit_out "CockroachDB failed to start" $E_GENERAL
 	fi
 	echo "CockroachDB is running"
 }
@@ -219,7 +241,14 @@ stop_cockroachdb()
 	cockroach_bin="${cockroach_dir}/cockroach"
 	echo "Stopping CockroachDB..."
 	$cockroach_bin quit --insecure --host=127.0.0.1:26257 > /dev/null 2>&1
-	sleep 2
+
+	for i in $(seq 1 10); do
+		pgrep -f "cockroach start-single-node" > /dev/null 2>&1
+		if [[ $? -ne 0 ]]; then
+			break
+		fi
+		sleep 1
+	done
 
 	# Kill any remaining cockroach processes
 	pkill -f "cockroach start-single-node" 2>/dev/null
@@ -252,10 +281,14 @@ run_single_workload()
 		--concurrency $conc --duration $duration --drop --ramp $ramp \
 		'postgresql://root@127.0.0.1:26257?sslmode=disable' \
 		> $out_file 2>&1
+	if [[ $? -ne 0 ]]; then
+		echo "Warning: workload run for $workload_name at concurrency $conc exited non-zero, see $out_file" >&2
+	fi
 
 	dur_num="${duration%s}"
 	ops_sec=$(grep -E "^\s*${dur_num}(\.[0-9]+)?s" "$out_file" | tail -1 | awk '{print $4}')
 	if [[ -z $ops_sec ]]; then
+		echo "Warning: failed to parse ops/sec for $workload_name at concurrency $conc from $out_file, recording 0" >&2
 		ops_sec=0
 	fi
 	echo $ops_sec
@@ -277,11 +310,12 @@ execute_cockroachdb()
 
 		for conc in $run_concurrency;
 		do
+			start_cockroachdb
+
 			if [[ $to_use_pcp -eq 1 ]]; then
 				start_pcp_subset
 			fi
 
-			start_cockroachdb
 			start_time=$(retrieve_time_stamp)
 
 			echo "Running: $workload_name at concurrency $conc (iteration $iter)"
@@ -354,7 +388,7 @@ generate_combine_report()
 			file="cockroachdb_iter_${iter}.csv"
 			rval=$(grep "^${workload_name},${conc}," $file | cut -d, -f3 | cut -d. -f1)
 			if [[ -z $rval ]]; then
-				exit_out "Error: failed to parse ${workload_name},${conc} from cockroachdb_iter_${iter}.csv" 104
+				exit_out "Error: failed to parse ${workload_name},${conc} from cockroachdb_iter_${iter}.csv" $E_INVAL_DATA
 			fi
 			let "sum=${sum}+${rval}"
 			values="${values}${val_sep}${rval}"
