@@ -1,0 +1,20 @@
+{
+  "dependencies": {
+    "rhel": [
+      "bc",
+      "zip"
+    ],
+    "ubuntu": [
+      "bc",
+      "zip"
+    ],
+    "sles": [
+      "bc",
+      "zip"
+    ],
+    "amzn": [
+      "bc",
+      "zip"
+    ]
+  }
+}

@@ -1,0 +1,535 @@
+#!/bin/bash
+#
+#                         License
+#
+#=================================================
+# Copyright (C) 2026  Sayali Bhavsar sbhavsar@redhat.com
+#=================================================
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+# Automates execution of CockroachDB benchmarks.  Downloads the CockroachDB
+# binary, starts a single-node insecure cluster, runs the specified workloads,
+# collects results, and tears everything down.
+#
+
+#=================================================
+cockroachdb_wrapper_version="v1.00"
+test_name="cockroachdb"
+cockroach_version="v22.2.0"
+#=================================================
+results_file="results_${test_name}.csv"
+arguments="$@"
+script_dir=$(realpath $(dirname $0))
+pcpdir=""
+
+duration="90s"
+ramp="10s"
+concurrency=""
+opts_file=""
+
+exit_out()
+{
+	echo $1
+	exit $2
+}
+
+if [ ! -f "/tmp/${test_name}.out" ]; then
+	command="${0} $@"
+	echo $command
+	$command &> /tmp/${test_name}.out
+	rtc=$?
+	cat /tmp/${test_name}.out
+	rm /tmp/${test_name}.out
+	exit $rtc
+fi
+
+curdir=$(dirname $(realpath $0))
+if [[ $0 == "./"* ]]; then
+	chars=`echo $0 | awk -v RS='/' 'END{print NR-1}'`
+	if [[ $chars == 1 ]]; then
+		run_dir=`pwd`
+	else
+		run_dir=`echo $0 | cut -d'/' -f 1-${chars} | cut -d'.' -f2-`
+		run_dir="${curdir}${run_dir}"
+	fi
+elif [[ $0 != "/"* ]]; then
+	dir=`echo $0 | rev | cut -d'/' -f2- | rev`
+	run_dir="${curdir}/${dir}"
+else
+	chars=`echo $0 | awk -v RS='/' 'END{print NR-1}'`
+	run_dir=`echo $0 | cut -d'/' -f 1-${chars}`
+	if [[ $run_dir != "/"* ]]; then
+		run_dir=${curdir}/${run_dir}
+	fi
+fi
+cd $run_dir
+
+show_usage=0
+
+TOOLS_BIN="$HOME/test_tools"
+export TOOLS_BIN
+
+#
+# error_codes is normally sourced by general_setup, but a few failures below
+# can happen before general_setup runs.  Provide matching defaults so named
+# codes are always available, then pick up the authoritative values once
+# error_codes exists.
+#
+E_GENERAL=101
+E_INVAL_DATA=106
+if [[ -f "$TOOLS_BIN/error_codes" ]]; then
+	source "$TOOLS_BIN/error_codes"
+fi
+
+usage()
+{
+	echo "Usage $1:"
+	echo "  --cockroach_version <value>: CockroachDB version to download (e.g., \"v24.3.33\")."
+	echo "    Defaults to v22.2.0.  Versions >= v23.2 require x86-64-v2 CPU support."
+	echo "  --concurrency <value>: Comma-separated list of concurrency levels to test"
+	echo "    (e.g., \"128,256,512,1024\").  Defaults to 128,256,512,1024."
+	echo "  --duration <value>: How long each workload runs (e.g., \"90s\", \"120s\")."
+	echo "    Defaults to 90s."
+	echo "  --opts_file <path>: Workload configuration file to use."
+	echo "    Defaults to test_opts in the script directory."
+	echo "  --ramp <value>: Ramp-up period before measurement begins (e.g., \"10s\")."
+	echo "    Defaults to 10s."
+	source $TOOLS_BIN/general_setup --usage
+	exit $E_USAGE
+}
+
+attempt_tools_generic()
+{
+	method="$1"
+	if [[ ! -d "$TOOLS_BIN" ]]; then
+		$method ${tools_git}/archive/refs/heads/main.zip
+		if [[ $? -eq 0 ]]; then
+			unzip -q main.zip
+			mv test_tools-wrappers-main ${TOOLS_BIN}
+			rm main.zip
+		fi
+	fi
+}
+
+attempt_tools_git()
+{
+	if [[ ! -d "$TOOLS_BIN" ]]; then
+		git clone $tools_git "$TOOLS_BIN"
+		if [ $? -ne 0 ]; then
+			exit_out "Error: pulling git $tools_git failed." $E_GENERAL
+		fi
+	fi
+}
+
+install_test_tools()
+{
+	#
+	# Clone the repo that contains the common code and tools
+	#
+	tools_git=https://github.com/redhat-performance/test_tools-wrappers
+	found=0
+	for arg in "$@"; do
+		if [ $found -eq 1 ]; then
+			tools_git=$arg
+			found=0
+		fi
+		if [[ $arg == "--tools_git" ]]; then
+			found=1
+		fi
+
+		#
+		# Check for usage here before calling the common parsers.
+		# Otherwise the script exits without showing test-specific options.
+		#
+		if [[ $arg == "--usage" ]]; then
+			show_usage=1
+		fi
+	done
+
+	#
+	# Only clone if the test tools directory does not already exist.
+	#
+	attempt_tools_generic "wget"
+	attempt_tools_generic "curl -L -O "
+	attempt_tools_git
+
+	if [ $show_usage -eq 1 ]; then
+		usage $1
+	fi
+}
+
+#
+# Download and extract the CockroachDB binary if not already present.
+#
+install_cockroachdb()
+{
+	cockroach_dir="${run_dir}/cockroach-build-${cockroach_version}"
+	if [[ -d "$cockroach_dir" ]]; then
+		echo "CockroachDB already installed at $cockroach_dir"
+		return
+	fi
+
+	arch=$(uname -m)
+	if [[ $arch == "aarch64" ]]; then
+		tarball="cockroach-${cockroach_version}.linux-3.7.10-gnu-aarch64.tgz"
+	else
+		tarball="cockroach-${cockroach_version}.linux-amd64.tgz"
+	fi
+
+	echo "Downloading CockroachDB ${cockroach_version}..."
+	url="https://binaries.cockroachdb.com/${tarball}"
+	wget -q "$url" -O "$tarball" 2>/dev/null
+	if [[ $? -ne 0 ]]; then
+		curl -sL "$url" -o "$tarball" 2>/dev/null
+		if [[ $? -ne 0 ]]; then
+			exit_out "Failed to download CockroachDB from $url" $E_GENERAL
+		fi
+	fi
+
+	tar -xf "$tarball"
+	dirname=$(echo "$tarball" | sed "s/.tgz//")
+	mv "$dirname" "$cockroach_dir"
+	rm -f "$tarball"
+	echo "CockroachDB installed to $cockroach_dir"
+}
+
+#
+# Start CockroachDB in single-node insecure mode.
+#
+start_cockroachdb()
+{
+	cockroach_bin="${cockroach_dir}/cockroach"
+	echo "Starting CockroachDB single-node cluster..."
+	$cockroach_bin start-single-node --cache .25 --insecure --background \
+		--store=${run_dir}/cockroach-data --listen-addr=127.0.0.1:26257 \
+		--http-addr=127.0.0.1:8080 > ${run_dir}/cockroach_start.log 2>&1
+
+	ready=0
+	for i in $(seq 1 30); do
+		$cockroach_bin node status --insecure --host=127.0.0.1:26257 > /dev/null 2>&1
+		if [[ $? -eq 0 ]]; then
+			ready=1
+			break
+		fi
+		sleep 1
+	done
+
+	if [[ $ready -eq 0 ]]; then
+		exit_out "CockroachDB failed to start" $E_GENERAL
+	fi
+	echo "CockroachDB is running"
+}
+
+#
+# Stop CockroachDB and remove the data directory.
+#
+stop_cockroachdb()
+{
+	cockroach_bin="${cockroach_dir}/cockroach"
+	echo "Stopping CockroachDB..."
+	$cockroach_bin quit --insecure --host=127.0.0.1:26257 > /dev/null 2>&1
+
+	for i in $(seq 1 10); do
+		pgrep -f "cockroach start-single-node" > /dev/null 2>&1
+		if [[ $? -ne 0 ]]; then
+			break
+		fi
+		sleep 1
+	done
+
+	# Kill any remaining cockroach processes
+	pkill -f "cockroach start-single-node" 2>/dev/null
+	sleep 1
+
+	rm -rf ${run_dir}/cockroach-data
+	echo "CockroachDB stopped and data cleaned up"
+}
+
+#
+# Run a single workload at a given concurrency level.
+# Parse ops/sec from the cockroach workload output.
+#
+# The cockroach workload output looks like:
+#   _elapsed___errors_____ops(total)___ops/sec(cum)__avg(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)__result
+#      90.0s        0          16325        181.4      3.7      0.6     10.0     65.0    125.8
+#
+# The ops/sec(cum) value comes from the final summary line (column 4).
+#
+run_single_workload()
+{
+	workload_name=$1
+	workload_opts=$2
+	conc=$3
+	iter=$4
+
+	out_file="${run_dir}/raw_${workload_name}_c${conc}_iter${iter}.out"
+
+	$cockroach_bin workload run $workload_opts \
+		--concurrency $conc --duration $duration --drop --ramp $ramp \
+		'postgresql://root@127.0.0.1:26257?sslmode=disable' \
+		> $out_file 2>&1
+	if [[ $? -ne 0 ]]; then
+		echo "Warning: workload run for $workload_name at concurrency $conc exited non-zero, see $out_file" >&2
+	fi
+
+	dur_num="${duration%s}"
+	ops_sec=$(grep -E "^\s*${dur_num}(\.[0-9]+)?s" "$out_file" | tail -1 | awk '{print $4}')
+	if [[ -z $ops_sec ]]; then
+		echo "Warning: failed to parse ops/sec for $workload_name at concurrency $conc from $out_file, recording 0" >&2
+		ops_sec=0
+	fi
+	echo $ops_sec
+}
+
+#
+# Run all workloads across all concurrency levels for one iteration.
+#
+execute_cockroachdb()
+{
+	iter=${1}
+	out_file="${run_dir}/cockroachdb_iter_${iter}"
+
+	run_concurrency=$(echo $concurrency | sed "s/,/ /g")
+	while IFS= read -r test_info
+	do
+		workload_name=$(echo $test_info | cut -d, -f1)
+		workload_opts=$(echo $test_info | cut -d, -f2)
+
+		for conc in $run_concurrency;
+		do
+			start_cockroachdb
+
+			if [[ $to_use_pcp -eq 1 ]]; then
+				start_pcp_subset
+			fi
+
+			start_time=$(retrieve_time_stamp)
+
+			echo "Running: $workload_name at concurrency $conc (iteration $iter)"
+			ops_sec=$(run_single_workload "$workload_name" "$workload_opts" "$conc" "$iter")
+
+			if [[ $to_use_pcp -eq 0 ]]; then
+				rm -f "${run_dir}/raw_${workload_name}_c${conc}_iter${iter}.out"
+			fi
+
+			end_time=$(retrieve_time_stamp)
+			stop_cockroachdb
+
+			echo "${workload_name},${conc},${ops_sec},0,${start_time},${end_time}" >> ${out_file}.csv
+
+			if [[ $to_use_pcp -eq 1 ]]; then
+				results2pcp_add_value "iteration:${iter}"
+				results2pcp_add_value "concurrency:${conc}"
+				results2pcp_add_value "average:${ops_sec}"
+				results2pcp_add_value_commit
+				stop_pcp_subset
+				reset_pcp_om
+			fi
+		done
+	done < "$opts_file"
+
+	#
+	# Write the CSV header and validate results for this iteration.
+	#
+	tmpcsv=$(mktemp)
+	$TOOLS_BIN/test_header_info --front_matter --results_file $tmpcsv \
+		--host $to_configuration --sys_type $to_sys_type \
+		--tuned $to_tuned_setting --results_version $cockroachdb_wrapper_version \
+		--test_name $test_name --field_header "Workload,Concurrency,Average,Deviation"
+	cat ${out_file}.csv >> $tmpcsv
+	mv $tmpcsv ${out_file}.csv
+
+	${TOOLS_BIN}/csv_to_json $to_json_flags --csv_file ${out_file}.csv --output_file cockroachdb_verify.json
+	test_rtc=$?
+	if [[ $test_rtc -ne 0 ]]; then
+		exit_out "${TOOLS_BIN}/csv_to_json failed for ${out_file}.csv" $test_rtc
+	fi
+	${TOOLS_BIN}/verify_results $to_verify_flags --schema_file $script_dir/../result_schema.py --class_name Cockroachdb_Results --file cockroachdb_verify.json
+	test_rtc=$?
+	if [[ $test_rtc -ne 0 ]]; then
+		echo Test failure detected: $out_file
+	fi
+}
+
+generate_combine_report()
+{
+	rm -f $results_file
+
+	$TOOLS_BIN/test_header_info --front_matter --results_file $results_file \
+		--host $to_configuration --sys_type $to_sys_type \
+		--tuned $to_tuned_setting --results_version $cockroachdb_wrapper_version \
+		--test_name $test_name --field_header "Workload,Concurrency,Average,Deviation"
+
+	combos=$(grep -v "^#" cockroachdb_iter_1.csv | tail -n +2 | cut -d, -f1,2)
+
+	for combo in $combos
+	do
+		workload_name=$(echo $combo | cut -d, -f1)
+		conc=$(echo $combo | cut -d, -f2)
+		sum=0
+		values=""
+		val_sep=""
+		start_time=$(grep "^${workload_name},${conc}," cockroachdb_iter_1.csv | cut -d, -f5)
+		end_time=$(grep "^${workload_name},${conc}," cockroachdb_iter_${to_times_to_run}.csv | cut -d, -f6)
+		for iter in $(seq 1 1 $to_times_to_run); do
+			file="cockroachdb_iter_${iter}.csv"
+			rval=$(grep "^${workload_name},${conc}," $file | cut -d, -f3 | cut -d. -f1)
+			if [[ -z $rval ]]; then
+				exit_out "Error: failed to parse ${workload_name},${conc} from cockroachdb_iter_${iter}.csv" $E_INVAL_DATA
+			fi
+			let "sum=${sum}+${rval}"
+			values="${values}${val_sep}${rval}"
+			val_sep=" "
+		done
+		avg=$(echo "scale=1; $sum/$to_times_to_run" | bc | sed 's/^\./0./')
+		deviation=0
+		if [[ $to_times_to_run -gt 1 ]]; then
+			sumsq=0
+			for v in $values; do
+				sumsq=$(echo "$sumsq + ($v - $avg) * ($v - $avg)" | bc)
+			done
+			stddev=$(echo "scale=2; sqrt($sumsq / $to_times_to_run)" | bc -l | sed 's/^\./0./')
+			if [[ $(echo "$avg > 0" | bc) -eq 1 ]]; then
+				deviation=$(echo "scale=2; $stddev * 100 / $avg" | bc | sed 's/^\./0./')
+			fi
+		fi
+		echo ${workload_name},${conc},${avg},${deviation},${start_time},${end_time} >> $results_file
+	done
+}
+
+install_test_tools "$@"
+
+#
+# Variables set by general setup.
+#
+# TOOLS_BIN: points to the tool directory
+# to_home_root: home directory
+# to_configuration: configuration information
+# to_times_to_run: number of times to run the test
+# to_run_label: Label for the run
+# to_user: User on the test system running the test
+# to_sys_type: for results info, basically aws, azure or local
+# to_sysname: name of the system
+# to_tuned_setting: tuned setting
+#
+
+pushd $curdir 2> /dev/null
+source "$TOOLS_BIN/general_setup" "$@"
+popd 2> /dev/null
+# Gather hardware information
+$TOOLS_BIN/gather_data ${curdir}
+
+ARGUMENT_LIST=(
+	"cockroach_version"
+	"concurrency"
+	"duration"
+	"opts_file"
+	"ramp"
+)
+
+NO_ARGUMENTS=(
+	"usage"
+)
+
+# read arguments
+opts=$(getopt \
+	--longoptions "$(printf "%s:," "${ARGUMENT_LIST[@]}")" \
+	--longoptions "$(printf "%s," "${NO_ARGUMENTS[@]}")" \
+	--name "$(basename "$0")" \
+	--options "h" \
+	-- "$@"
+)
+
+eval set --$opts
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--cockroach_version)
+			cockroach_version=$2
+			shift 2
+		;;
+		--concurrency)
+			concurrency=$2
+			shift 2
+		;;
+		--duration)
+			duration=$2
+			shift 2
+		;;
+		--opts_file)
+			opts_file=$2
+			shift 2
+		;;
+		--ramp)
+			ramp=$2
+			shift 2
+		;;
+		--usage)
+			usage $0
+		;;
+		-h)
+			usage $0
+		;;
+		--)
+			break
+		;;
+		*)
+			echo option not found $1
+			usage $0
+		;;
+	esac
+done
+
+if [[ $concurrency == "" ]]; then
+	concurrency="128,256,512,1024"
+fi
+
+if [[ $opts_file == "" ]]; then
+	opts_file="${run_dir}/test_opts"
+fi
+
+package_tool --no_packages $to_no_pkg_install --wrapper_config $curdir/../cockroachdb.json
+
+install_cockroachdb
+
+# Set up PCP if enabled
+if [[ $to_use_pcp -eq 1 ]]; then
+	source $TOOLS_BIN/pcp/pcp_commands.inc
+	setup_pcp
+	pcp_cfg=$TOOLS_BIN/pcp/default.cfg
+	pcpdir=/tmp/pcp_`date "+%Y.%m.%d-%H.%M.%S"`
+	echo "Start PCP"
+	echo start_pcp ${pcpdir}/ ${test_name} $pcp_cfg
+	start_pcp ${pcpdir}/ ${test_name} $pcp_cfg
+fi
+
+rm -rf ${run_dir}/*csv ${run_dir}/raw_*.out
+for iter in $(seq 1 1 $to_times_to_run); do
+	execute_cockroachdb $iter
+done
+generate_combine_report
+
+# Shutdown PCP and clean up
+if [[ $to_use_pcp -eq 1 ]]; then
+	shutdown_pcp
+fi
+
+${TOOLS_BIN}/save_results --curdir $curdir --home_root $to_home_root \
+	--other_files "*_summary,run*log,test_results_report,${pcpdir},*csv,raw_*.out" \
+	--results $results_file --test_name cockroachdb \
+	--tuned_setting=$to_tuned_setting --version $cockroachdb_wrapper_version --user $to_user
+
+exit $E_SUCCESS
